@@ -1,122 +1,88 @@
 /**
- * main.ino — Agri-Watch ESP32 Controller
- * 
- * Handles: pump relay, status LEDs, TFT display, flow meter, buzzer.
- * Communicates with the backend server via MQTT over WiFi.
- * 
- * Startup sequence:
- *   1. Init Serial
- *   2. Init LEDs, motor, buzzer, display
- *   3. Connect WiFi
- *   4. Connect MQTT + subscribe
- *   5. Attach flow meter ISR
- *   6. Enter main loop
+ * main.ino — Agri-Watch ESP32 (USB Serial mode)
+ *
+ * WiFi and MQTT are REMOVED.
+ * All communication is over USB serial to the Raspberry Pi.
+ * Pi handles WiFi, MQTT, and cloud connectivity.
  */
 
 #include <Arduino.h>
 #include "config.h"
-#include "topics.h"
 
-// Forward declarations (defined in other .ino files)
-void setupWifiMqtt();
-void mqttLoop();
-bool mqttConnected();
+extern void setupSerial();
+extern void serialLoop();
+extern void setupMotor();
+extern void setupLeds();
+extern void setupDisplay();
+extern void setupFlowMeter();
+extern void setupBuzzer();
+extern void publishStatus();
+extern void publishFlow();
+extern void checkMotorSafetyTimeout();
+extern void flowMeterLoop();
+extern void updateDisplay(const String&, const String&, const String&);
+extern void setLedState(const String&);
+extern void beep(int, int);
 
-void setupMotor();
-void motorOn(float dosage_ml, String trigger);
-void motorOff(String trigger);
-void checkMotorSafetyTimeout();
-bool isMotorRunning();
+String g_mode      = "auto";
+String g_disease   = "—";
+String g_severity  = "none";
+float  g_dosage_ml = 0.0f;
 
-void setupLeds();
-void setLedState(const String& state);
-
-void setupDisplay();
-void updateDisplay(const String& l1, const String& l2, const String& l3);
-void displayLoop();
-
-void setupFlowMeter();
-void flowMeterLoop();
-float getTotalLitres();
-float getFlowRateLPM();
-void resetFlowMeter();
-
-void setupBuzzer();
-void beep(int freq, int duration_ms);
-
-void publishStatus();
-void publishFlow();
-
-// ── Globals shared across files ───────────────────────────────────────────────
-String g_mode       = "auto";     // "auto" | "manual"
-String g_disease    = "—";
-String g_severity   = "none";
-float  g_dosage_ml  = 0.0f;
-
-unsigned long g_lastStatusPublish = 0;
-unsigned long g_lastFlowPublish   = 0;
-unsigned long g_lastDisplayUpdate = 0;
-
-// ─────────────────────────────────────────────────────────────────────────────
+unsigned long g_lastStatusMs = 0;
+unsigned long g_lastFlowMs   = 0;
+unsigned long g_lastDisplayMs = 0;
 
 void setup() {
-    Serial.begin(115200);
-    delay(200);
-    Serial.println("\n\n══ Agri-Watch ESP32 Controller ══");
+  setupSerial();      // USB serial — must be first
+  setupLeds();
+  setLedState("idle");
+  setupMotor();
+  setupBuzzer();
+  setupFlowMeter();
+  setupDisplay();
 
-    setupLeds();
-    setLedState("error");          // red while connecting
+  updateDisplay("AGRI-WATCH", "USB Serial Mode", "Waiting for Pi...");
+  beep(1000, 100);
 
-    setupMotor();
-    setupBuzzer();
-    setupFlowMeter();
-    setupDisplay();
-    updateDisplay("AGRI-WATCH", "Connecting WiFi...", "");
-
-    setupWifiMqtt();               // blocks until WiFi + MQTT connected
-
-    setLedState("idle");
-    updateDisplay("AGRI-WATCH", "Mode: " + g_mode, "MQTT: OK");
-    beep(1000, 100);
-    Serial.println("Setup complete.");
+  Serial.println("{\"type\":\"ready\",\"msg\":\"ESP32 setup complete\"}");
 }
 
 void loop() {
-    mqttLoop();                    // keep MQTT alive, dispatch callbacks
-    checkMotorSafetyTimeout();     // hard-off after MAX_SPRAY_DURATION_MS
-    flowMeterLoop();               // accumulate pulse count into litres
+  serialLoop();                 // read + dispatch Pi commands
+  checkMotorSafetyTimeout();    // hard safety cutoff
+  flowMeterLoop();              // accumulate pulse count
 
-    unsigned long now = millis();
+  unsigned long now = millis();
 
-    // Publish heartbeat status
-    if (now - g_lastStatusPublish >= STATUS_PUBLISH_INTERVAL_MS) {
-        publishStatus();
-        g_lastStatusPublish = now;
+  if (now - g_lastStatusMs >= STATUS_PUBLISH_INTERVAL_MS) {
+    publishStatus();            // sends JSON line to Pi via Serial
+    g_lastStatusMs = now;
+  }
+  if (now - g_lastFlowMs >= FLOW_REPORT_INTERVAL_MS) {
+    publishFlow();
+    g_lastFlowMs = now;
+  }
+  if (now - g_lastDisplayMs >= DISPLAY_UPDATE_INTERVAL_MS) {
+    // Refresh TFT with current state
+    extern bool isMotorRunning();
+    extern float getFlowRateLPM();
+    extern float getTotalLitres();
+    if (isMotorRunning()) {
+      updateDisplay(
+        "SPRAYING",
+        "Flow: " + String(getFlowRateLPM(), 2) + " L/min",
+        "Total: "  + String(getTotalLitres(), 3) + " L"
+      );
+    } else {
+      updateDisplay(
+        "Mode: " + g_mode,
+        g_disease == "—" ? "Idle" : g_disease,
+        "Sev: " + g_severity
+      );
     }
+    g_lastDisplayMs = now;
+  }
 
-    // Publish flow data
-    if (now - g_lastFlowPublish >= FLOW_REPORT_INTERVAL_MS) {
-        if (isMotorRunning()) publishFlow();
-        g_lastFlowPublish = now;
-    }
-
-    // Refresh TFT display
-    if (now - g_lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL_MS) {
-        if (isMotorRunning()) {
-            updateDisplay(
-                "SPRAYING",
-                "Flow: " + String(getFlowRateLPM(), 2) + " L/min",
-                "Total: " + String(getTotalLitres(), 3) + " L"
-            );
-        } else {
-            updateDisplay(
-                "Mode: " + g_mode,
-                g_disease == "—" ? "No detection" : g_disease,
-                "Sev: " + g_severity
-            );
-        }
-        g_lastDisplayUpdate = now;
-    }
-
-    delay(10);
+  delay(10);
 }
